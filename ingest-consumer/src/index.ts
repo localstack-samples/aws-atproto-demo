@@ -1,0 +1,124 @@
+// Always-on ingest consumer: connects to the ATProto firehose and fans events
+// into AWS.
+//
+// Why Fargate instead of Lambda?
+// The firehose is a WebSocket — a long-lived, always-open connection. Lambda
+// functions are short-lived and time out; Fargate runs a container 24/7.
+//
+// This process does exactly two things for every event it receives:
+//   1. Append the raw JSON line to S3 (durable archive you can replay later).
+//   2. Publish a normalized copy to Amazon EventBridge so downstream
+//      consumers (analytics, moderation, notifications Lambdas) can react
+//      without knowing about each other or about this ingest process.
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  EventBridgeClient,
+  PutEventsCommand,
+} from "@aws-sdk/client-eventbridge";
+import WebSocket from "ws";
+
+const FIREHOSE_URL = process.env.FIREHOSE_URL ?? "ws://localhost:8080";
+const S3_BUCKET = process.env.S3_BUCKET ?? "raw-firehose-archive";
+const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME ?? "atproto-events";
+const FLUSH_MAX_EVENTS = Number(process.env.FLUSH_MAX_EVENTS ?? 20);
+const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS ?? 10_000);
+
+// LocalStack S3 expects path-style URLs (bucket in the path, not the hostname).
+const s3 = new S3Client({ forcePathStyle: true });
+const eventBridge = new EventBridgeClient({});
+
+// ATProto "collections" name the kind of record in a commit (post, like,
+// follow). We map each to an EventBridge detail-type so rules can filter on
+// event kind without parsing ATProto-specific fields.
+const DETAIL_TYPE_BY_COLLECTION: Record<string, string> = {
+  "app.bsky.feed.post": "post.created",
+  "app.bsky.feed.like": "like.created",
+  "app.bsky.graph.follow": "follow.created",
+};
+
+// --- S3 raw archive: buffer NDJSON, flush on count or timer -----------------
+
+let buffer: string[] = [];
+
+async function flushToS3() {
+  if (buffer.length === 0) return;
+  const batch = buffer;
+  buffer = [];
+
+  const now = new Date();
+  const prefix = [
+    now.getUTCFullYear(),
+    String(now.getUTCMonth() + 1).padStart(2, "0"),
+    String(now.getUTCDate()).padStart(2, "0"),
+    String(now.getUTCHours()).padStart(2, "0"),
+  ].join("/");
+  const key = `raw/${prefix}/${crypto.randomUUID()}.ndjson`; // e.g. raw/2026/07/28/14/<uuid>.ndjson
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: batch.join("\n") + "\n",
+      ContentType: "application/x-ndjson",
+    }),
+  );
+  console.log(`flushed ${batch.length} events -> s3://${S3_BUCKET}/${key}`);
+}
+
+setInterval(flushToS3, FLUSH_INTERVAL_MS);
+
+// --- EventBridge fan-out: thin normalization, then PutEvents ----------------
+
+async function publishToEventBridge(raw: any) {
+  const detailType = DETAIL_TYPE_BY_COLLECTION[raw.commit?.collection];
+  if (!detailType) return; // ignore collections this demo doesn't route
+
+  // EventBridge is AWS's event bus — publish once, many subscribers can react.
+  await eventBridge.send(
+    new PutEventsCommand({
+      Entries: [
+        {
+          EventBusName: EVENT_BUS_NAME,
+          Source: "atproto.ingest",
+          DetailType: detailType,
+          Detail: JSON.stringify({
+            did: raw.did,
+            time_us: raw.time_us,
+            collection: raw.commit.collection,
+            operation: raw.commit.operation,
+            record: raw.commit.record,
+          }),
+        },
+      ],
+    }),
+  );
+}
+
+// --- WebSocket: connect to mock firehose or real Jetstream ------------------
+
+function connect() {
+  const ws = new WebSocket(FIREHOSE_URL);
+
+  ws.on("open", () => console.log(`connected to firehose at ${FIREHOSE_URL}`));
+
+  ws.on("message", async (data) => {
+    const line = data.toString(); // one Jetstream commit, one JSON line
+    buffer.push(line);
+    if (buffer.length >= FLUSH_MAX_EVENTS) flushToS3().catch(console.error);
+
+    try {
+      await publishToEventBridge(JSON.parse(line));
+    } catch (err) {
+      console.error("failed to publish event to EventBridge:", err);
+    }
+  });
+
+  // Reconnect on disconnect — the firehose (or mock) may restart.
+  ws.on("close", () => {
+    console.log("firehose connection closed, reconnecting in 2s");
+    setTimeout(connect, 2000);
+  });
+  ws.on("error", (err) => console.error("firehose connection error:", err.message));
+}
+
+connect();

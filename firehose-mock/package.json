@@ -1,0 +1,19 @@
+{
+  "name": "firehose-mock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mock Jetstream-style WebSocket firehose for the ATProto ingestion demo",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

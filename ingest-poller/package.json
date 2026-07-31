@@ -1,0 +1,19 @@
+{
+  "name": "ingest-poller",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lambda handler for interval-based firehose ingestion. Unlike lambdas/package.json, `ws` here is a real dependency (not types-only) - it isn't part of the Lambda runtime, so it must be physically installed for esbuild to bundle it into the deployed function.",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.658.0",
+    "@aws-sdk/client-eventbridge": "^3.658.0",
+    "@aws-sdk/client-s3": "^3.658.0",
+    "@aws-sdk/lib-dynamodb": "^3.658.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.6.0"
+  }
+}

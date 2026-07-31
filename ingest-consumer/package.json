@@ -1,0 +1,21 @@
+{
+  "name": "ingest-consumer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Long-running consumer: holds the firehose WebSocket open, archives raw events to S3, and fans them out via EventBridge",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-eventbridge": "^3.658.0",
+    "@aws-sdk/client-s3": "^3.658.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

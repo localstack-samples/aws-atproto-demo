@@ -1,0 +1,14 @@
+{
+  "name": "lambdas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Types-only package.json - these AWS SDK v3 clients ship inside the Lambda Node.js runtime, so CDK's NodejsFunction bundler treats them as external and never packages them. Installed here purely so editors resolve types.",
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.658.0",
+    "@aws-sdk/client-sqs": "^3.658.0",
+    "@aws-sdk/lib-dynamodb": "^3.658.0",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.6.0"
+  }
+}
