@@ -42,7 +42,8 @@ If you're new to ATProto, here's the minimum context:
   service exposes it as plain JSON over WebSocket (easier than the raw
   binary firehose, which uses CBOR/CAR encoding).
 - This demo mocks Jetstream's JSON shape so you can run the full pipeline
-  offline, then swap one URL to point at the real network.
+  offline, then swap one URL to point at a real, low-volume corner of the
+  network — see [Pointing at the real firehose](#pointing-at-the-real-firehose-leaflet).
 
 ![Architecture: mock firehose → Fargate ingest consumer → S3 archive and EventBridge fan-out → three Lambdas → DynamoDB / SQS](docs/architecture.png)
 
@@ -59,6 +60,7 @@ ingestion is identical.)_
 | Ingest compute    | **Fargate or Lambda** — two interchangeable options              | See [Two ways to ingest](#two-ways-to-ingest). Fargate holds a persistent connection open; Lambda polls on a schedule. Neither is "correct" — it depends on how much latency your use case can tolerate.          |
 | Fan-out mechanism | **EventBridge**, not direct invocation or SNS                    | EventBridge is AWS's event bus. Content-based filtering lets each consumer subscribe to exactly what it needs without the ingest side knowing any of them exist. Consumers can be added or removed independently. |
 | Raw storage       | **S3, written before fan-out**                                   | S3 is object storage. The raw NDJSON log is the source of truth, independent of whatever EventBridge consumers exist today — it enables replay/reprocessing later.                                                |
+| Real-network scope | **Leaflet's collections** (`pub.leaflet.*`), filtered at the source via Jetstream's `wantedCollections`, not the full `app.bsky.*` firehose | The full firehose's volume overwhelms LocalStack's Lambda/ECS emulation (and its cost on real AWS is untested but presumably non-trivial at that rate). Filtering to a small, real, low-volume app keeps the real-network path genuinely runnable end-to-end on LocalStack — see [Pointing at the real firehose](#pointing-at-the-real-firehose-leaflet). |
 
 Whichever ingestion stack you deploy, it only does two things: append every
 event to S3, and `PutEvents` a normalized version to EventBridge. Neither
@@ -96,8 +98,8 @@ ingest-consumer/      Fargate task app code: firehose -> S3 archive + EventBridg
 ingest-poller/        Lambda app code: same job, run on a schedule instead of held open
 lambdas/
   analytics/           counts events per type, per hour
-  moderation/           flags posts matching a keyword list
-  notifications/        alerts on new followers of watchlisted accounts
+  moderation/           flags comments matching a keyword list
+  notifications/        alerts on new subscribers to watchlisted publications
   common/types.ts       shared event shape
 infra-fargate/         CDK stack: S3, DynamoDB, SQS, EventBridge, Lambdas, ECS/Fargate
 infra-poller/          CDK stack: same storage/EventBridge/Lambdas, scheduled ingest-poller instead
@@ -203,17 +205,17 @@ lstk aws s3 ls s3://raw-firehose-archive/raw/ --recursive
 # live per-type, per-hour counters
 lstk aws dynamodb scan --table-name AnalyticsCounts
 
-# posts flagged for moderation (sample data includes posts with keywords like "spam", "scam", "click here")
+# comments flagged for moderation (sample data includes comments with keywords like "spam", "scam", "click here")
 lstk aws dynamodb scan --table-name FlaggedContent
 
-# queued notifications for watchlisted accounts (sample data already includes follows of them)
+# queued notifications for watchlisted publications (sample data already includes subscriptions to them)
 QUEUE_URL=$(lstk aws sqs get-queue-url --queue-name notifications-queue --query QueueUrl --output text)
 lstk aws sqs receive-message --queue-url "$QUEUE_URL" --max-number-of-messages 10
 ```
 
 You can also review all the resources and data in the browser using the [LocalStack Console](https://app.localstack.cloud/inst/default/status).
 
-The sample data in [`firehose-mock/data/sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) contains a handful of posts with moderation keywords and follows targeting the notification watchlist, so both tables populate within the
+The sample data in [`firehose-mock/data/sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) contains a handful of comments with moderation keywords and subscriptions targeting the notification watchlist, so both tables populate within the
 first loop.
 
 **6. Trigger the spike — the dramatic beat**
@@ -314,79 +316,68 @@ Docker containers between runs.
 
 The mock firehose sends ~35 events on a slow loop. The Quickstart exercises the full pipeline (ingest → S3 → EventBridge → three fan-out Lambdas) at a volume your laptop should comfortably emulate. LocalStack handles that workload well, and repeated `cdk deploy` / invoke cycles are exactly the type of local testing LocalStack is designed for.
 
-However, when you point ingestion at the real Bluesky Jetstream it may be diffcult for LocalStack to keep up with the full fan-out pipeline depending on the resources of your machine. This is a volume and emulation issue, not a flaw in the architecture:
+The real Bluesky Jetstream firehose, unfiltered, is a different story: it's the full `app.bsky.*` firehose across all of Bluesky, and each downstream Lambda runs in its own Docker container inside LocalStack's emulation (unlike production Lambda, where runtimes are reused and concurrency is managed). The Analytics rule matches _every_ event on the bus, so a single poller catch-up of thousands of events can trigger thousands of Analytics invocations in quick succession — enough to spawn a large number of Node processes, exhaust Docker memory, and leave LocalStack unresponsive. That's a volume and emulation-scaling issue, not a flaw in the architecture, and it's likely non-trivial cost on real AWS too at that rate (untested, but the volume alone is the concern).
 
-|                           | Mock firehose on LocalStack  | Real Jetstream on LocalStack         | Real Jetstream on AWS             |
-| ------------------------- | ---------------------------- | ------------------------------------ | --------------------------------- |
-| **Purpose**               | Learn the pattern offline    | Smoke-test ingest connectivity       | Realistic load and fan-out        |
-| **Typical volume**        | ~35 events, trickle or spike | Thousands of events per poll/connect | Same as Jetstream delivers        |
-| **Analytics invocations** | ~35 (one Lambda per event)   | ~3,000+ per poll (one per event)     | Same count, but AWS Lambda scales |
-| **LocalStack fit**        | ✅ Intended path             | ⚠️ Ingest OK; full pipeline risky    | N/A                               |
+**This is why the demo's real-network path points at [Leaflet](https://leaflet.pub) instead of the full firehose** — see [Pointing at the real firehose](#pointing-at-the-real-firehose-leaflet). Filtering to Leaflet's collections at the source keeps real-network volume in roughly the same ballpark as the mock, so the full pipeline (not just ingest) is safe to run against real, live ATProto traffic on LocalStack — no AWS sandbox required for that.
 
-### Why the real firehose strains LocalStack locally
+If you deliberately point at the full unfiltered firehose instead (not this demo's recommended path), expect the volume problems described above, and treat it as an ingest-only smoke test rather than a full-pipeline test — a real AWS sandbox account is the right place for that, since the same CDK stacks deploy unchanged there.
 
-Eeach downstream Lambda runs in its own Docker container inside LocalStack's emulation which differs from production Lambda, where runtimes are reused and concurrency is managed. The Analytics rule matches _every_ event on the bus, so a single poller catch-up of ~3,000 events can trigger ~3,000 Analytics invocations in quick succession, plus Moderation and Notifications where rules match. That can spawn thousands of Node processes, exhaust Docker memory, and leave LocalStack unresponsive. The ingest side (archive to S3, cursor advance, connection to Jetstream) may work fine; it is the EventBridge fan-out at production volume that does not map cleanly to a laptop.
-
-**What we recommend:**
-
-- **LocalStack + mock firehose** — default for the demo walkthrough. No caveats beyond occasional `docker container prune -f` between long sessions.
-- **LocalStack + real Jetstream** — reasonable for a short ingest smoke test (confirm the poller connects, writes S3 objects, advances the cursor). Treat fan-out tables (`AnalyticsCounts`, etc.) as best-effort. Do not invoke the poller in a tight loop. Prune containers between attempts. Not recommended as a sustained load test.
-- **Real AWS (sandbox account)** — the right place to run the full pipeline against the real firehose for any serious validation: volume, latency, Lambda concurrency, and downstream behavior at Jetstream rates. The same CDK stacks deploy unchanged only the environment changes.
-
-LocalStack absolutely supports real-world patterns — S3, DynamoDB,
-EventBridge rules, Lambda wiring, scheduled invocations, ECS/Fargate. The caveat is matching production event volume to local emulation scaling limits.
-
-**Between long LocalStack sessions** (especially after real-firehose
-tests), `lstk reset` does not remove Lambda/ECS containers Docker spawned on your behalf. Prune them before things get sluggish:
+**Between long LocalStack sessions**, `lstk reset` does not remove Lambda/ECS containers Docker spawned on your behalf. Prune them before things get sluggish:
 
 ```bash
 docker container prune -f
 ```
 
-## Pointing at the real Bluesky firehose
+## Pointing at the real firehose (Leaflet)
 
-The mock server and the real [Jetstream](https://github.com/bluesky-social/jetstream) service emit the same JSON shape. To ingest the real thing, redeploy with `FIREHOSE_URL` set. Both stacks read it at deploy time and pass it to their ingestion compute:
+The mock server and the real [Jetstream](https://github.com/bluesky-social/jetstream) service emit the same JSON shape, so ingesting the real thing is a `FIREHOSE_URL` change, not a code change. But the full firehose is every post/like/follow across all of Bluesky — far more volume than this demo's infra needs to prove the pattern, and (per [LocalStack vs. real AWS](#localstack-vs-real-aws)) more than LocalStack's Lambda/ECS emulation can comfortably keep up with.
+
+Jetstream supports filtering to specific collections at the source via a repeated `wantedCollections` query parameter (up to 100, prefix wildcards supported). This demo filters to [Leaflet](https://leaflet.pub)'s three collections — `pub.leaflet.document` (posts), `pub.leaflet.comment`, and `pub.leaflet.graph.subscription` — a small, real ATProto publishing app whose actual production traffic is low enough to run the full pipeline against on LocalStack, not just smoke-test ingest:
 
 ```bash
-# LocalStack (ingest smoke test — see caveats above)
 # infra-fargate
 cd infra-fargate
 lstk cdk bootstrap
-FIREHOSE_URL=wss://jetstream2.us-east.bsky.network/subscribe lstk cdk deploy --require-approval never
+FIREHOSE_URL="wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=pub.leaflet.document&wantedCollections=pub.leaflet.comment&wantedCollections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
 
 # infra-poller
 cd infra-poller
-FIREHOSE_URL=wss://jetstream2.us-east.bsky.network/subscribe lstk cdk deploy --require-approval never
-
-# Real AWS sandbox (recommended for full pipeline at production volume)
-cd infra-poller   # or infra-fargate
-cdk bootstrap
-FIREHOSE_URL=wss://jetstream2.us-east.bsky.network/subscribe cdk deploy
+FIREHOSE_URL="wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=pub.leaflet.document&wantedCollections=pub.leaflet.comment&wantedCollections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
 ```
 
-No code changes required. The Fargate task picks up the new URL on its
-next restart (deploy triggers one automatically); the poller Lambda picks it up on its next invocation.
+No further code changes required — quote the URL so your shell doesn't
+split it on the `&` characters. The Fargate task picks up the new URL on
+its next restart (deploy triggers one automatically); the poller Lambda
+picks it up on its next invocation.
 
-**After a real-firehose poll on LocalStack**, verify ingest succeeded
-before checking downstream tables — S3 archive and poller logs are the
-signal that matters locally:
+Leaflet is a small, beta-stage app, so expect real traffic to be
+noticeably quieter than the mock's jittered loop — there's no `/spike`
+equivalent for real activity. Verify ingest is working the same way as
+the Quickstart's step 5:
 
 ```bash
-lstk aws logs tail /aws/lambda/atproto-ingest-poller
+lstk aws logs tail /aws/lambda/atproto-ingest-poller   # or /atproto-demo/ingest-consumer for infra-fargate
 lstk aws s3 ls s3://raw-firehose-archive/raw/ --recursive
 ```
 
-If LocalStack becomes slow or unresponsive, run `docker container prune -f` and `lstk reset`, then redeploy. Avoid back-to-back manual invokes while the 2-minute schedule is active; each catch-up batch fans out to every matching rule.
+**If you point at the full unfiltered firehose instead** (drop the
+`?wantedCollections=...` query string, or filter on `app.bsky.*`
+collections — note the fan-out Lambdas and EventBridge rules are written
+for Leaflet's shapes, so `app.bsky.*` events wouldn't map to anything
+meaningful without further changes), treat it as an ingest-only smoke
+test on LocalStack, not a full-pipeline test — see
+[LocalStack vs. real AWS](#localstack-vs-real-aws) for why, and prune
+containers (`docker container prune -f`) if things get slow.
 
 ## What each piece actually does
 
-- **`firehose-mock/`** replays [`sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) (35 hand-authored post/like/follow commit events in Jetstream shape) on a jittered loop, over a plain WebSocket. `POST /spike` temporarily collapses the delay between events.
-- **`ingest-consumer/`** (used by `infra-fargate/`) holds the WebSocket connection open, buffers events, flushes NDJSON to S3 on a count/time threshold, and maps each event's ATProto `collection` field to an EventBridge detail-type (`app.bsky.feed.post` → `post.created`, etc.) before publishing it.
+- **`firehose-mock/`** replays [`sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) (35 hand-authored `pub.leaflet.document`/`comment`/`graph.subscription` commit events, matching [Leaflet](https://leaflet.pub)'s actual lexicon shape) on a jittered loop, over a plain WebSocket. `POST /spike` temporarily collapses the delay between events.
+- **`ingest-consumer/`** (used by `infra-fargate/`) holds the WebSocket connection open, buffers events, flushes NDJSON to S3 on a count/time threshold, and maps each event's ATProto `collection` field to an EventBridge detail-type (`pub.leaflet.document` → `document.created`, etc.) before publishing it.
 - **`ingest-poller/`** (used by `infra-poller/`) does the same archive-then-publish job, but wakes up on a schedule instead of staying connected: reads the last cursor from DynamoDB, connects to the firehose with `?cursor=<value>` for up to 10 seconds to drain whatever's new, archives and publishes it all in one batch, then saves the new cursor and exits. The collection → detail-type mapping is duplicated from `ingest-consumer/` rather than shared. Each ingestion path stays readable on its own, without cross-referencing the other's internals.
 - **`lambdas/analytics`** matches every event on the bus and increments a per-event-type, per-hour counter in DynamoDB.
-- **`lambdas/moderation`** is only invoked for `post.created` events whose `record.text` matched a keyword list via EventBridge's wildcard content filtering. The Lambda itself just records the hit in DynamoDB. (EventBridge filters are case-sensitive and match substrings literally, not by meaning. A full-featured moderation system would apply semantic analysis or human review on top of keyword filters.)
+- **`lambdas/moderation`** is only invoked for `comment.created` events whose `record.plaintext` matched a keyword list via EventBridge's wildcard content filtering. The Lambda itself just records the hit in DynamoDB. (`pub.leaflet.document` has no plaintext field of its own — its content lives in nested block pages — so moderation only ever fires on comments, not documents. EventBridge filters are also case-sensitive and match substrings literally, not by meaning; a full-featured moderation system would apply semantic analysis or human review on top of keyword filters.)
 
-- **`lambdas/notifications`** is only invoked for `follow.created` events where `record.subject` (the account being followed) is on a watchlist, again filtered by EventBridge before the Lambda runs. It pushes an SQS message as a stand-in for a push notification or webhook.
+- **`lambdas/notifications`** is only invoked for `subscription.created` events where `record.publication` (the publication being subscribed to) is on a watchlist, again filtered by EventBridge before the Lambda runs. It pushes an SQS message as a stand-in for a push notification or webhook.
 
 Each Lambda is intentionally under 30 lines: one trigger, one job, one
 output. The filtering logic lives in the EventBridge rules

@@ -34,11 +34,12 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 // Same collection -> EventBridge detail-type mapping as ingest-consumer,
 // duplicated rather than shared across packages so each ingestion path
-// stays independently readable (see README).
+// stays independently readable (see README). These are Leaflet's
+// (https://leaflet.pub) lexicons - see the README for why.
 const DETAIL_TYPE_BY_COLLECTION: Record<string, string> = {
-  "app.bsky.feed.post": "post.created",
-  "app.bsky.feed.like": "like.created",
-  "app.bsky.graph.follow": "follow.created",
+  "pub.leaflet.document": "document.created",
+  "pub.leaflet.comment": "comment.created",
+  "pub.leaflet.graph.subscription": "subscription.created",
 };
 
 const CURSOR_KEY = "poller"; // single fixed row - this demo only runs one poller
@@ -76,7 +77,13 @@ async function saveCursor(cursorUs: number) {
 function drainFirehose(cursor: number): Promise<any[]> {
   return new Promise((resolve) => {
     const collected: any[] = [];
-    const url = cursor > 0 ? `${FIREHOSE_URL}?cursor=${cursor}` : FIREHOSE_URL;
+    // Built via URL/searchParams rather than string interpolation: once
+    // FIREHOSE_URL carries its own query string (e.g. Leaflet's
+    // ?wantedCollections=... filter - see the README), naively appending
+    // "?cursor=" would produce a second "?" and a malformed URL.
+    const wsUrl = new URL(FIREHOSE_URL);
+    if (cursor > 0) wsUrl.searchParams.set("cursor", String(cursor));
+    const url = wsUrl.toString();
     console.log(`connecting to firehose at ${url}`);
     // handshakeTimeout aborts (emitting 'error') if the WS/TLS handshake
     // itself doesn't complete in time - the mock always answers instantly,

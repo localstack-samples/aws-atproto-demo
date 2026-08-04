@@ -24,13 +24,13 @@ import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as logs from "aws-cdk-lib/aws-logs";
 
 // Demo-only config. Production systems would load these from a database or
-// parameter store. Keywords must appear literally in post text — EventBridge
-// wildcard filters are case-sensitive.
+// parameter store. Keywords must appear literally in comment text —
+// EventBridge wildcard filters are case-sensitive.
 const MODERATION_KEYWORDS = ["spam", "scam", "free money", "click here"];
-// DIDs (decentralized IDs) of accounts we want follow alerts for.
-const NOTIFICATION_WATCHLIST_DIDS = [
-  "did:plc:watchweb3vip1",
-  "did:plc:watchweb3vip2",
+// At-uris of publications we want new-subscriber alerts for.
+const NOTIFICATION_WATCHLIST_PUBLICATIONS = [
+  "at://did:plc:writer4h2mvz7ndp/pub.leaflet.publication/protocoldigest",
+  "at://did:plc:writer8jvbnq5trm/pub.leaflet.publication/weeklyroundup",
 ];
 
 export class AtprotoFargateStack extends Stack {
@@ -125,8 +125,10 @@ export class AtprotoFargateStack extends Stack {
       targets: [new targets.LambdaFunction(analyticsFn)],
     });
 
-    // Rule 2: post.created + keyword in text → moderation
-    // Wildcard filters run BEFORE Lambda — unmatched posts never invoke it.
+    // Rule 2: comment.created + keyword in plaintext → moderation
+    // Wildcard filters run BEFORE Lambda — unmatched comments never invoke
+    // it. (pub.leaflet.document has no plaintext field - its content lives
+    // in nested block pages - so moderation only ever fires on comments.)
     // One rule per keyword, not one rule with all keywords OR'd together:
     // EventBridge caps how complex a wildcard pattern can be, and each
     // "*keyword*" needs a leading + trailing wildcard to match anywhere in
@@ -138,23 +140,23 @@ export class AtprotoFargateStack extends Stack {
         eventBus,
         eventPattern: {
           source: ["atproto.ingest"],
-          detailType: ["post.created"],
+          detailType: ["comment.created"],
           detail: {
-            record: { text: [{ wildcard: `*${keyword}*` }] },
+            record: { plaintext: [{ wildcard: `*${keyword}*` }] },
           },
         },
         targets: [new targets.LambdaFunction(moderationFn)],
       });
     });
 
-    // Rule 3: follow.created + watched account → notifications
-    // record.subject is the DID of the account being followed.
+    // Rule 3: subscription.created + watched publication → notifications
+    // record.publication is the at-uri of the publication being subscribed to.
     new events.Rule(this, "NotificationsRule", {
       eventBus,
       eventPattern: {
         source: ["atproto.ingest"],
-        detailType: ["follow.created"],
-        detail: { record: { subject: NOTIFICATION_WATCHLIST_DIDS } },
+        detailType: ["subscription.created"],
+        detail: { record: { publication: NOTIFICATION_WATCHLIST_PUBLICATIONS } },
       },
       targets: [new targets.LambdaFunction(notificationsFn)],
     });

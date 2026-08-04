@@ -27,13 +27,13 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
 
 // Demo-only config. Production systems would load these from a database or
-// parameter store. Keywords must appear literally in post text — EventBridge
-// wildcard filters are case-sensitive.
+// parameter store. Keywords must appear literally in comment text —
+// EventBridge wildcard filters are case-sensitive.
 const MODERATION_KEYWORDS = ["spam", "scam", "free money", "click here"];
-// DIDs (decentralized IDs) of accounts we want follow alerts for.
-const NOTIFICATION_WATCHLIST_DIDS = [
-  "did:plc:watchweb3vip1",
-  "did:plc:watchweb3vip2",
+// At-uris of publications we want new-subscriber alerts for.
+const NOTIFICATION_WATCHLIST_PUBLICATIONS = [
+  "at://did:plc:writer4h2mvz7ndp/pub.leaflet.publication/protocoldigest",
+  "at://did:plc:writer8jvbnq5trm/pub.leaflet.publication/weeklyroundup",
 ];
 
 // How often the poller Lambda wakes up and checks for new events. Shorter
@@ -144,15 +144,16 @@ export class AtprotoPollerStack extends Stack {
 
     // One rule per keyword, not one rule with all keywords OR'd together —
     // see infra-fargate/lib/atproto-fargate-stack.ts for why (EventBridge's
-    // wildcard-complexity limit).
+    // wildcard-complexity limit). pub.leaflet.document has no plaintext
+    // field, so this only ever matches comment.created events.
     MODERATION_KEYWORDS.forEach((keyword, i) => {
       new events.Rule(this, `ModerationRule${i}`, {
         eventBus,
         eventPattern: {
           source: ["atproto.ingest"],
-          detailType: ["post.created"],
+          detailType: ["comment.created"],
           detail: {
-            record: { text: [{ wildcard: `*${keyword}*` }] },
+            record: { plaintext: [{ wildcard: `*${keyword}*` }] },
           },
         },
         targets: [new targets.LambdaFunction(moderationFn)],
@@ -163,8 +164,8 @@ export class AtprotoPollerStack extends Stack {
       eventBus,
       eventPattern: {
         source: ["atproto.ingest"],
-        detailType: ["follow.created"],
-        detail: { record: { subject: NOTIFICATION_WATCHLIST_DIDS } },
+        detailType: ["subscription.created"],
+        detail: { record: { publication: NOTIFICATION_WATCHLIST_PUBLICATIONS } },
       },
       targets: [new targets.LambdaFunction(notificationsFn)],
     });

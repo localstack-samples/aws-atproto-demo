@@ -27,13 +27,18 @@ const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS ?? 10_000);
 const s3 = new S3Client({ forcePathStyle: true });
 const eventBridge = new EventBridgeClient({});
 
-// ATProto "collections" name the kind of record in a commit (post, like,
-// follow). We map each to an EventBridge detail-type so rules can filter on
-// event kind without parsing ATProto-specific fields.
+// ATProto "collections" name the kind of record in a commit. We map each
+// to an EventBridge detail-type so rules can filter on event kind without
+// parsing ATProto-specific fields.
+//
+// These are Leaflet's (https://leaflet.pub) lexicons, not Bluesky's
+// app.bsky.* ones - see the README's "Pointing at the real firehose"
+// section for why: Leaflet's real traffic volume is low enough for this
+// demo's infra to keep up with, unlike the full social firehose.
 const DETAIL_TYPE_BY_COLLECTION: Record<string, string> = {
-  "app.bsky.feed.post": "post.created",
-  "app.bsky.feed.like": "like.created",
-  "app.bsky.graph.follow": "follow.created",
+  "pub.leaflet.document": "document.created",
+  "pub.leaflet.comment": "comment.created",
+  "pub.leaflet.graph.subscription": "subscription.created",
 };
 
 // --- S3 raw archive: buffer NDJSON, flush on count or timer -----------------
