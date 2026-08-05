@@ -209,9 +209,10 @@ This collapses the mock firehose's event delay for 15 seconds, simulating a burs
 
 **7. Clean up**
 
-Cleaning up LocalStack just requires stopping the container (be sure to also stop the firehose mock).
+Cleaning up LocalStack just requires stopping the container (be sure to also stop the firehose mock). It's suggested that you reset the container before stopping to ensure that all the spawned containers are also cleaned up.
 
 ```bash
+lstk reset --force
 lstk stop
 ```
 
@@ -279,9 +280,10 @@ piling up in the mock firehose's rolling history buffer. Invoke the poller (step
 
 **5. Clean up**
 
-Cleaning up LocalStack just requires stopping the container (be sure to also stop the firehose mock).
+Cleaning up LocalStack just requires stopping the container (be sure to also stop the firehose mock). It's suggested that you reset the container before stopping to ensure that all the spawned containers are also cleaned up.
 
 ```bash
+lstk reset --force
 lstk stop
 ```
 
