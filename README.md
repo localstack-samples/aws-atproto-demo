@@ -44,7 +44,7 @@ alternative swaps the Fargate box for a scheduled Lambda, but everything to the 
 | Ingest compute     | **Fargate or Lambda** — two interchangeable options                                                                                         | See [two ways to ingest](#two-ways-to-ingest). Fargate holds a persistent connection open; Lambda polls on a schedule. Which one you choose depends on how much latency your use case can tolerate.                                                                                                                                                                 |
 | Fan-out mechanism  | **EventBridge**, not direct invocation or SNS                                                                                               | EventBridge is AWS's event bus. Content-based filtering lets each consumer subscribe to exactly what it needs without the ingest side knowing any of them exist. Consumers can be added or removed independently.                                                                                                                                                   |
 | Raw storage        | **S3, written before fan-out**                                                                                                              | S3 is object storage. The raw NDJSON log is the source of truth, independent of whatever EventBridge consumers exist today. It enables replay/reprocessing later.                                                                                                                                                                                                   |
-| Real-network scope | **Leaflet's collections** (`pub.leaflet.*`), filtered at the source via Jetstream's `wantedCollections`, not the full `app.bsky.*` firehose | The full firehose's volume can quickly overwhelm LocalStack's Lambda/ECS emulation (and its cost on real AWS is untested but presumably non-trivial at that rate). Filtering to a small, real, low-volume app keeps the real-network path genuinely runnable end-to-end on LocalStack. See [pointing at the real firehose](#pointing-at-the-real-firehose-leaflet). |
+| Real-network scope | **Leaflet's collections** (`pub.leaflet.*`), filtered at the source via Jetstream's `collections` parameter, not the full `app.bsky.*` firehose | The full firehose's volume can quickly overwhelm LocalStack's Lambda/ECS emulation (and its cost on real AWS is untested but presumably non-trivial at that rate). Filtering to a small, real, low-volume app keeps the real-network path genuinely runnable end-to-end on LocalStack. See [pointing at the real firehose](#pointing-at-the-real-firehose-leaflet). |
 
 Whichever ingestion stack you deploy, it only does two things: append every event to S3, and `PutEvents` a normalized version to EventBridge. Neither one has any idea the analytics, moderation, or notifications Lambdas exist, which is the whole point of the pattern.
 
@@ -320,21 +320,32 @@ docker container prune -f
 
 The mock server and the real [Jetstream](https://github.com/bluesky-social/jetstream) service emit the same JSON shape, so ingesting the real thing is a `FIREHOSE_URL` change, not a code change. But the full firehose is every post/like/follow across all of Bluesky. This is far more volume than this demo's infra needs, and (per [LocalStack vs. real AWS](#localstack-vs-real-aws)) more than LocalStack's Lambda/ECS emulation can comfortably keep up with.
 
-Jetstream supports filtering to specific collections at the source via a repeated `wantedCollections` query parameter (up to 100, prefix wildcards supported). This demo filters to [Leaflet](https://leaflet.pub)'s three collections: `pub.leaflet.document` (posts), `pub.leaflet.comment`, and `pub.leaflet.graph.subscription`. Leaflet is a small, real ATProto publishing app whose actual production traffic is low enough to run the full pipeline against on LocalStack, not just smoke-test ingest:
+Jetstream supports filtering to specific collections at the source via a repeated `collections` query parameter (up to 100, prefix wildcards supported). This demo filters to [Leaflet](https://leaflet.pub)'s three collections: `pub.leaflet.document` (posts), `pub.leaflet.comment`, and `pub.leaflet.graph.subscription`. Leaflet is a small, real ATProto publishing app whose actual production traffic is low enough to run the full pipeline against on LocalStack, not just smoke-test ingest:
 
 ```bash
 # infra-fargate
 cd infra-fargate
 lstk cdk bootstrap
-FIREHOSE_URL="wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=pub.leaflet.document&wantedCollections=pub.leaflet.comment&wantedCollections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
+FIREHOSE_URL="wss://jetstream.us-east.bsky.network/subscribe?collections=pub.leaflet.document&collections=pub.leaflet.comment&collections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
 
 # infra-poller
 cd infra-poller
 lstk cdk bootstrap
-FIREHOSE_URL="wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=pub.leaflet.document&wantedCollections=pub.leaflet.comment&wantedCollections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
+FIREHOSE_URL="wss://jetstream.us-east.bsky.network/subscribe?collections=pub.leaflet.document&collections=pub.leaflet.comment&collections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
 ```
 
 No further code changes required. The Fargate task picks up the new URL on its next restart (deploy triggers one automatically); the poller Lambda picks it up on its next invocation.
+
+`jetstream.us-east.bsky.network` / `jetstream.us-west.bsky.network` are the
+[v2 Jetstream hosts](https://atproto.com/blog/introducing-bluesky-protocol-services).
+The live tail here is unauthenticated and behaves the same as before —
+same envelope shape, same `?cursor=<time_us>` reconnect semantics. v2's
+only wire-level change that matters for this demo is the filter
+parameter's name (`collections`, not v1's `wantedCollections`); the older
+`jetstream1`/`jetstream2.us-east`/`us-west` v1 hosts keep running
+unchanged if you ever need them, just with the old parameter name. v2 also
+adds an authenticated historical-replay API (`planSnapshot`/`listSegments`/`getSegment`)
+for backfilling from an archive, which this demo doesn't use.
 
 Leaflet is a small, beta-stage app, so expect real traffic to be
 noticeably quieter than the mock. Verify ingest is working the same way as the Quickstart's step 5:
@@ -344,7 +355,7 @@ lstk aws logs tail /aws/lambda/atproto-ingest-poller   # or /atproto-demo/ingest
 lstk aws s3 ls s3://raw-firehose-archive/raw/ --recursive
 ```
 
-You can choose to point at the full unfiltered firehose instead by dropping the `?wantedCollections=...` query string, or filter on `app.bsky.*` collections. However, note that the fan-out Lambdas and EventBridge rules are written for Leaflet's shapes, so `app.bsky.*` events wouldn't map to anything meaningful without further code changes.
+You can choose to point at the full unfiltered firehose instead by dropping the `?collections=...` query string, or filter on `app.bsky.*` collections. However, note that the fan-out Lambdas and EventBridge rules are written for Leaflet's shapes, so `app.bsky.*` events wouldn't map to anything meaningful without further code changes.
 
 ## What each piece actually does
 
