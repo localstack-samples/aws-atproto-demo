@@ -58,7 +58,7 @@ Both stacks provision the _identical_ downstream contract: same S3 bucket name, 
 | Delivery latency      | Near-real-time (~1s)                             | Bounded by the poll interval                                                                                                           |
 | Idle cost             | Pays for a running container 24/7                | Pays only per invocation                                                                                                               |
 | Extra infra           | VPC, ECS cluster, Fargate service, `IngestCursor` table | One DynamoDB table (`IngestCursor`) to remember where it left off                                                                |
-| How it resumes        | Reconnects with `?cursor=<seq>` after a disconnect | Reconnects with `?cursor=<seq>`, replaying from the last Jetstream v2 sequence number at the `subscribeEvents` endpoint |
+| How it resumes        | Reconnects with `?cursor=<seq>` after a disconnect | Reconnects with `?cursor=<seq>` within Jetstream's WebSocket lookback; archive backfill is not included |
 | The "spike" demo beat | Counters visibly climb in real time as you watch | Trigger the spike, then the next poll (scheduled, or triggered manually) catches the whole burst up in one batch                       |
 
 Use `infra-fargate/` when you want events processed as they happen. Use
@@ -277,8 +277,11 @@ lstk aws logs tail /aws/lambda/atproto-ingest-poller
 curl -X POST http://localhost:8080/spike
 ```
 
-Unlike the Fargate path, nothing happens immediately. The events are
-piling up in the mock firehose's rolling history buffer. Invoke the poller (step 3's command) and you can see it catch up the entire burst in a single batch: one S3 archive object, one wave of `PutEvents` calls, one cursor update. The gap in connectivity doesn't lose data, it just gets processed in one go the next time the poller runs.
+Unlike the Fargate path, nothing happens immediately. Because step 3 saved a
+cursor, the spike events are piling up in the mock firehose's rolling history
+buffer. Invoke the poller again and it catches up the retained burst in a
+single batch: one S3 archive object, one wave of `PutEvents` calls, and one
+cursor update. The mock retains 500 events, so keep this demo beat short.
 
 **5. Clean up**
 
@@ -368,9 +371,12 @@ cursor to save for reconnects. The `kinds=commit` filter excludes account,
 identity, and sync messages so this demo receives only record mutations.
 The older `jetstream1`/`jetstream2.us-east`/`us-west` v1 hosts and their
 `/subscribe` endpoint use a different payload and `wantedCollections`
-parameter; they are not interchangeable with this demo. v2 also adds an
-authenticated historical-replay API (`planSnapshot`/`listSegments`/`getSegment`)
-for backfilling from an archive, which this demo doesn't use.
+parameter; they are not interchangeable with this demo. Jetstream's WebSocket
+resume window is bounded (36 hours by default); a first connection tails live
+data, and an older saved sequence is rejected as `CursorTooOld`. Jetstream's
+archive-replay flow starts with `planSnapshot` and downloads the selected
+sealed archive data; it is the appropriate way to backfill such a gap, but is
+intentionally outside this demo's scope.
 
 Leaflet is a small, beta-stage app, so expect real traffic to be
 noticeably quieter than the mock. Verify ingest is working the same way as the Quickstart's step 5:
@@ -386,7 +392,7 @@ You can choose to point at the full unfiltered firehose instead by dropping the 
 
 - **`firehose-mock/`** replays [`sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) (35 hand-authored `pub.leaflet.document`/`comment`/`graph.subscription` commit events, matching [Leaflet](https://leaflet.pub)'s actual lexicon shape) in Jetstream v2 envelopes on a jittered loop, over a plain WebSocket. `POST /spike` temporarily collapses the delay between events.
 - **`ingest-consumer/`** (used by `infra-fargate/`) holds the WebSocket connection open, buffers events, flushes NDJSON to S3 on a count/time threshold, and maps each event's ATProto `collection` field to an EventBridge detail-type (`pub.leaflet.document` → `document.created`, etc.) before publishing it. It saves the last successfully published Jetstream sequence cursor in DynamoDB and uses it to resume after a disconnect.
-- **`ingest-poller/`** (used by `infra-poller/`) does the same archive-then-publish job, but wakes up on a schedule instead of staying connected: reads the last Jetstream sequence cursor from DynamoDB, connects to the firehose with `?cursor=<seq>` for up to 10 seconds to drain whatever's new, archives and publishes it all in one batch, then saves the new cursor and exits. The collection → detail-type mapping is duplicated from `ingest-consumer/` rather than shared. Each ingestion path stays readable on its own, without cross-referencing the other's internals.
+- **`ingest-poller/`** (used by `infra-poller/`) does the same archive-then-publish job, but wakes up on a schedule instead of staying connected: reads the last Jetstream sequence cursor from DynamoDB, connects to the firehose with `?cursor=<seq>` for up to 10 seconds to drain whatever's new, archives and publishes it all in one batch, then saves the new cursor and exits. A connection, malformed message, or EventBridge entry failure leaves the cursor unchanged for an at-least-once retry. The collection → detail-type mapping is duplicated from `ingest-consumer/` rather than shared. Each ingestion path stays readable on its own, without cross-referencing the other's internals.
 - **`lambdas/analytics`** matches every event on the bus and increments a per-event-type, per-hour counter in DynamoDB.
 - **`lambdas/moderation`** is only invoked for `comment.created` events whose `record.plaintext` matched a keyword list via EventBridge's wildcard content filtering. The Lambda itself just records the hit in DynamoDB. (`pub.leaflet.document` has no plaintext field of its own — its content lives in nested block pages — so moderation only ever fires on comments, not documents. EventBridge filters are also case-sensitive and match substrings literally, not by meaning; a full-featured moderation system would apply semantic analysis or human review on top of keyword filters.)
 

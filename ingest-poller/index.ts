@@ -107,9 +107,10 @@ async function saveCursor(cursor: number) {
 
 // --- Firehose: connect briefly, drain, disconnect ---------------------------
 
-// Resolves with whatever arrived within the poll window - including an
-// empty array if the firehose never connects in time. A poll with nothing
-// new isn't a failure, so this never rejects.
+// Resolves with whatever arrived during the poll window, including an empty
+// array when the connection was healthy but no matching events arrived. A
+// connection or protocol error rejects instead: leaving the cursor unchanged
+// is safer than treating an incomplete drain as a successful empty poll.
 //
 // Logged explicitly at each stage (attempting/open/error/close) because a
 // real network endpoint can fail in ways a local mock never does - a
@@ -118,7 +119,7 @@ async function saveCursor(cursor: number) {
 // to go on, not a guarantee they'll fire. The setTimeout below is a second,
 // independent guard so the poll still ends even if none of them do.
 function drainFirehose(cursor: number): Promise<JetstreamCommit[]> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const collected: JetstreamCommit[] = [];
     // Built via URL/searchParams rather than string interpolation: once
     // FIREHOSE_URL carries its own query string (e.g. Leaflet's
@@ -145,14 +146,40 @@ function drainFirehose(cursor: number): Promise<JetstreamCommit[]> {
       resolve(collected);
     };
 
+    const fail = (error: Error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      ws.removeAllListeners();
+      ws.terminate();
+      reject(error);
+    };
+
     const timer = setTimeout(() => finish("timeout"), POLL_WINDOW_MS);
     ws.on("open", () => console.log("firehose connection open"));
     ws.on("message", (data) => {
-      const commit = parseCommit(JSON.parse(data.toString()));
-      if (commit) collected.push(commit);
+      try {
+        const commit = parseCommit(JSON.parse(data.toString()));
+        if (commit) collected.push(commit);
+      } catch (error) {
+        fail(new Error("firehose sent invalid JSON", { cause: error }));
+      }
     });
-    ws.on("error", (err) => finish(`error: ${err.message}`));
-    ws.on("close", () => finish("closed"));
+    ws.on("error", (err) => fail(new Error(`firehose connection error: ${err.message}`)));
+    ws.on("close", () =>
+      fail(new Error("firehose connection closed before the poll window ended")),
+    );
+    ws.on("unexpected-response", (_request, response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on("end", () => {
+        const body = Buffer.concat(chunks).toString();
+        const detail = body.includes("CursorTooOld")
+          ? "saved cursor is older than Jetstream's WebSocket lookback; archive backfill is required"
+          : body || `HTTP ${response.statusCode ?? "error"}`;
+        fail(new Error(`firehose subscription rejected: ${detail}`));
+      });
+    });
   });
 }
 
@@ -207,31 +234,29 @@ async function publishToEventBridge(events: JetstreamCommit[]) {
           }),
         }));
 
-      return entries.length > 0
-        ? eventBridge.send(new PutEventsCommand({ Entries: entries }))
-        : Promise.resolve();
+      if (entries.length === 0) return Promise.resolve();
+
+      return eventBridge.send(new PutEventsCommand({ Entries: entries })).then((result) => {
+        // PutEvents may return HTTP success while rejecting individual
+        // entries. Do not save the batch cursor unless every entry was
+        // accepted; the next poll will replay the range at-least-once.
+        if (result.FailedEntryCount) {
+          const failedEntry = result.Entries?.find((entry) => entry.ErrorCode);
+          throw new Error(
+            `EventBridge rejected event: ${failedEntry?.ErrorCode ?? "unknown error"} ${failedEntry?.ErrorMessage ?? ""}`,
+          );
+        }
+      });
     }),
   );
 }
 
-// A second, independent timeout guard around the whole handler - not just
-// drainFirehose's own internal one - so a poll against a real network
-// endpoint that hangs in some way neither `error` nor `close` catches
-// still ends before the Lambda's own timeout kills it with no logs at
-// all. Comfortably under the function's configured 60s timeout.
-const HANDLER_DEADLINE_MS = Number(process.env.HANDLER_DEADLINE_MS ?? 45_000);
-
 export async function handler() {
-  const timedOut = new Promise<"deadline">((resolve) =>
-    setTimeout(() => resolve("deadline"), HANDLER_DEADLINE_MS),
-  );
-
-  const result = await Promise.race([run(), timedOut]);
-  if (result === "deadline") {
-    console.log(
-      `handler deadline (${HANDLER_DEADLINE_MS}ms) hit before the poll finished on its own`,
-    );
-  }
+  // The Lambda timeout is the single deadline for the complete operation.
+  // Racing `run()` against a separate timer would return success while the
+  // original work can still archive, publish, or save a cursor in the
+  // background.
+  await run();
 }
 
 async function run() {

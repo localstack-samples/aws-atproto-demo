@@ -46,14 +46,10 @@ function jetstreamTime(): string {
 }
 
 // Real Jetstream supports resuming a subscription with ?cursor=<seq>,
-// replaying anything missed since that point. Our ingest-consumer never
-// disconnects so it never needs this, but ingest-poller (the interval-based
-// alternative) connects briefly, disconnects, and reconnects later with the
-// cursor of the last event it saw — so we keep a short rolling history to
-// replay on reconnect, the same way the real service does. Sized generously
-// (spike mode alone can emit ~300-400 events) so a poller that's slower to
-// reconnect than its poll interval still doesn't silently miss events once
-// they age out of the buffer.
+// replaying anything missed since that point. Both ingestion paths persist a
+// cursor and can reconnect, so we keep a short rolling history for the mock.
+// It is deliberately only a demo buffer (spike mode alone can emit ~300-400
+// events), not a substitute for Jetstream's archive-backfill API.
 const HISTORY_SIZE = 500;
 const history: any[] = [];
 
