@@ -25,6 +25,7 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
+import * as lambdaDestinations from "aws-cdk-lib/aws-lambda-destinations";
 
 // Demo-only config. Production systems would load these from a database or
 // parameter store. Keywords must appear literally in comment text —
@@ -81,6 +82,36 @@ export class AtprotoPollerStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    // EventBridge puts events here when it cannot deliver them to any target
+    // (for example, a target permission or service failure). Lambda's own
+    // execution failures go to the per-function queues below instead, where
+    // their invocation records retain the error details.
+    const targetDeliveryFailures = new sqs.Queue(this, "TargetDeliveryFailures", {
+      queueName: "atproto-target-delivery-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const analyticsProcessingFailures = new sqs.Queue(this, "AnalyticsProcessingFailures", {
+      queueName: "atproto-analytics-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const moderationProcessingFailures = new sqs.Queue(this, "ModerationProcessingFailures", {
+      queueName: "atproto-moderation-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const notificationsProcessingFailures = new sqs.Queue(this, "NotificationsProcessingFailures", {
+      queueName: "atproto-notifications-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const pollerProcessingFailures = new sqs.Queue(this, "PollerProcessingFailures", {
+      queueName: "atproto-poller-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
     // --- EventBridge bus: central fan-out point -----------------------------
 
     const eventBus = new events.EventBus(this, "AtprotoEventBus", {
@@ -133,13 +164,31 @@ export class AtprotoPollerStack extends Stack {
     });
     notificationsQueue.grantSendMessages(notificationsFn);
 
+    // An EventBridge target DLQ handles failures before Lambda accepts the
+    // event. configureAsyncInvoke's onFailure destination handles a Lambda
+    // timeout or handler error after that asynchronous handoff succeeds.
+    function downstreamTarget(handler: lambda.IFunction, processingFailures: sqs.IQueue) {
+      handler.configureAsyncInvoke({
+        onFailure: new lambdaDestinations.SqsDestination(processingFailures),
+      });
+      return new targets.LambdaFunction(handler, {
+        deadLetterQueue: targetDeliveryFailures,
+      });
+    }
+    const analyticsTarget = downstreamTarget(analyticsFn, analyticsProcessingFailures);
+    const moderationTarget = downstreamTarget(moderationFn, moderationProcessingFailures);
+    const notificationsTarget = downstreamTarget(
+      notificationsFn,
+      notificationsProcessingFailures,
+    );
+
     // --- EventBridge rules: the core of the decoupled fan-out pattern --------
     // Identical to infra-fargate — same patterns, same targets.
 
     new events.Rule(this, "AnalyticsRule", {
       eventBus,
       eventPattern: { source: ["atproto.ingest"] },
-      targets: [new targets.LambdaFunction(analyticsFn)],
+      targets: [analyticsTarget],
     });
 
     // One rule per keyword, not one rule with all keywords OR'd together —
@@ -156,7 +205,7 @@ export class AtprotoPollerStack extends Stack {
             record: { plaintext: [{ wildcard: `*${keyword}*` }] },
           },
         },
-        targets: [new targets.LambdaFunction(moderationFn)],
+        targets: [moderationTarget],
       });
     });
 
@@ -167,7 +216,7 @@ export class AtprotoPollerStack extends Stack {
         detailType: ["subscription.created"],
         detail: { record: { publication: NOTIFICATION_WATCHLIST_PUBLICATIONS } },
       },
-      targets: [new targets.LambdaFunction(notificationsFn)],
+      targets: [notificationsTarget],
     });
 
     // --- Ingest poller (scheduled Lambda) -----------------------------------
@@ -214,9 +263,15 @@ export class AtprotoPollerStack extends Stack {
     eventBus.grantPutEventsTo(pollerFn);
     ingestCursor.grantReadWriteData(pollerFn);
 
+    pollerFn.configureAsyncInvoke({
+      onFailure: new lambdaDestinations.SqsDestination(pollerProcessingFailures),
+    });
+
     new events.Rule(this, "IngestPollerSchedule", {
       schedule: events.Schedule.rate(POLL_INTERVAL),
-      targets: [new targets.LambdaFunction(pollerFn)],
+      targets: [new targets.LambdaFunction(pollerFn, {
+        deadLetterQueue: targetDeliveryFailures,
+      })],
     });
   }
 }

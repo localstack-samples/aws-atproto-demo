@@ -19,6 +19,7 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
+import * as lambdaDestinations from "aws-cdk-lib/aws-lambda-destinations";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -73,6 +74,31 @@ export class AtprotoFargateStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    // EventBridge puts events here when it cannot deliver them to any target
+    // (for example, a target permission or service failure). Lambda's own
+    // execution failures go to the per-function queues below instead, where
+    // their invocation records retain the error details.
+    const targetDeliveryFailures = new sqs.Queue(this, "TargetDeliveryFailures", {
+      queueName: "atproto-target-delivery-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const analyticsProcessingFailures = new sqs.Queue(this, "AnalyticsProcessingFailures", {
+      queueName: "atproto-analytics-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const moderationProcessingFailures = new sqs.Queue(this, "ModerationProcessingFailures", {
+      queueName: "atproto-moderation-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const notificationsProcessingFailures = new sqs.Queue(this, "NotificationsProcessingFailures", {
+      queueName: "atproto-notifications-processing-failures",
+      retentionPeriod: Duration.days(14),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
     // --- EventBridge bus: central fan-out point -----------------------------
 
     const eventBus = new events.EventBus(this, "AtprotoEventBus", {
@@ -123,6 +149,24 @@ export class AtprotoFargateStack extends Stack {
     });
     notificationsQueue.grantSendMessages(notificationsFn);
 
+    // An EventBridge target DLQ handles failures before Lambda accepts the
+    // event. configureAsyncInvoke's onFailure destination handles a Lambda
+    // timeout or handler error after that asynchronous handoff succeeds.
+    function downstreamTarget(handler: lambda.IFunction, processingFailures: sqs.IQueue) {
+      handler.configureAsyncInvoke({
+        onFailure: new lambdaDestinations.SqsDestination(processingFailures),
+      });
+      return new targets.LambdaFunction(handler, {
+        deadLetterQueue: targetDeliveryFailures,
+      });
+    }
+    const analyticsTarget = downstreamTarget(analyticsFn, analyticsProcessingFailures);
+    const moderationTarget = downstreamTarget(moderationFn, moderationProcessingFailures);
+    const notificationsTarget = downstreamTarget(
+      notificationsFn,
+      notificationsProcessingFailures,
+    );
+
     // --- EventBridge rules: the core of the decoupled fan-out pattern --------
     // Each rule subscribes to a subset of events. Downstream Lambdas never
     // know about each other; the ingest consumer never knows they exist.
@@ -131,7 +175,7 @@ export class AtprotoFargateStack extends Stack {
     new events.Rule(this, "AnalyticsRule", {
       eventBus,
       eventPattern: { source: ["atproto.ingest"] },
-      targets: [new targets.LambdaFunction(analyticsFn)],
+      targets: [analyticsTarget],
     });
 
     // Rule 2: comment.created + keyword in plaintext → moderation
@@ -154,7 +198,7 @@ export class AtprotoFargateStack extends Stack {
             record: { plaintext: [{ wildcard: `*${keyword}*` }] },
           },
         },
-        targets: [new targets.LambdaFunction(moderationFn)],
+        targets: [moderationTarget],
       });
     });
 
@@ -167,7 +211,7 @@ export class AtprotoFargateStack extends Stack {
         detailType: ["subscription.created"],
         detail: { record: { publication: NOTIFICATION_WATCHLIST_PUBLICATIONS } },
       },
-      targets: [new targets.LambdaFunction(notificationsFn)],
+      targets: [notificationsTarget],
     });
 
     // --- Ingest consumer (ECS Fargate) --------------------------------------
