@@ -143,7 +143,8 @@ lstk cdk deploy --require-approval never
 ```
 
 CDK builds the ingest consumer's Docker image and pushes it to ECR
-automatically. The same command works unchanged against real AWS.
+automatically. Against real AWS the same command works, with one change —
+see [deploying to real AWS](#deploying-to-real-aws).
 
 `--require-approval never` skips the "review IAM changes" confirmation
 prompt. Without it, `cdk deploy` waits for an interactive y/n answer before touching anything. Drop the flag if you want to review IAM
@@ -305,7 +306,28 @@ The real Bluesky Jetstream firehose, unfiltered, is a different story. It sends 
 
 This is why the demo's real-network path points at [Leaflet](https://leaflet.pub) instead of the full firehose. See [pointing at the real firehose](#pointing-at-the-real-firehose-leaflet). Filtering to Leaflet's collections at the source keeps real-network volume in a roughly similar ballpark to the mock, so the full pipeline (not just ingest) is safe to run against real, live ATProto traffic on LocalStack.
 
-If you deliberately point at the full unfiltered firehose instead, expect the volume problems described above, and treat it as an ingest-only smoke test rather than a full-pipeline test. A real AWS sandbox account is the right place for that, since the same CDK stacks deploy unchanged there.
+If you deliberately point at the full unfiltered firehose instead, expect the volume problems described above, and treat it as an ingest-only smoke test rather than a full-pipeline test. A real AWS sandbox account is the right place for that — see [deploying to real AWS](#deploying-to-real-aws).
+
+### Deploying to real AWS
+
+`infra-poller` deploys to a real account unchanged. `infra-fargate` needs one
+change: by default it sets `AWS_ENDPOINT_URL` on the ingest container so the
+SDK talks to LocalStack, and that variable has to be absent on real AWS or
+every S3/EventBridge call is sent to `host.docker.internal` and fails. Deploy
+with the override set to an empty value to omit it:
+
+```bash
+cd infra-fargate
+AWS_ENDPOINT_URL_FOR_CONSUMER= FIREHOSE_URL="wss://jetstream.us-east.bsky.network/subscribe?collections=pub.leaflet.document" cdk deploy --require-approval never
+```
+
+Networking needs no extra work. The stack creates a VPC with `natGateways: 0`
+and runs the task in a **public subnet with a public IP**, so its outbound
+traffic — Jetstream's WebSocket, the ECR image pull, and the S3/EventBridge
+API calls — goes out through the internet gateway at no hourly cost. The
+task's security group allows no inbound traffic. Moving the task to private
+subnets would require a NAT gateway (~$33/month) even if you added VPC
+endpoints for the AWS APIs, because Jetstream is on the public internet.
 
 If things get sluggish after a long session without a reset, or after
 deliberately testing the full unfiltered firehose (see

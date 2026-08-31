@@ -174,6 +174,12 @@ export class AtprotoFargateStack extends Stack {
       memoryLimitMiB: 512,
     });
 
+    // Empty string (or an explicit empty env var) means "use the real AWS
+    // endpoints" - see the environment block below.
+    const consumerEndpointUrl =
+      process.env.AWS_ENDPOINT_URL_FOR_CONSUMER ??
+      "http://host.docker.internal:4566";
+
     // CDK builds the image and pushes it to ECR automatically - on LocalStack
     // this needs ECR_ENDPOINT_STRATEGY=off (see README) or the docker login
     // during asset publishing can fail on macOS Docker Desktop.
@@ -195,22 +201,34 @@ export class AtprotoFargateStack extends Stack {
         // host.docker.internal = the machine running Docker (your laptop).
         // From inside the Fargate container, this reaches LocalStack and the mock firehose.
         FIREHOSE_URL: process.env.FIREHOSE_URL ?? "ws://host.docker.internal:8080",
-        AWS_ENDPOINT_URL:
-          process.env.AWS_ENDPOINT_URL_FOR_CONSUMER ??
-          "http://host.docker.internal:4566",
         S3_BUCKET: rawArchiveBucket.bucketName,
         EVENT_BUS_NAME: eventBus.eventBusName,
+        // Only set when targeting LocalStack. The SDK reads AWS_ENDPOINT_URL
+        // from the environment, so leaving it in place on real AWS would send
+        // every S3/EventBridge call to host.docker.internal and fail. Deploy
+        // with AWS_ENDPOINT_URL_FOR_CONSUMER= (empty) to omit it entirely.
+        ...(consumerEndpointUrl ? { AWS_ENDPOINT_URL: consumerEndpointUrl } : {}),
       },
     });
 
     rawArchiveBucket.grantWrite(taskDefinition.taskRole);
     eventBus.grantPutEventsTo(taskDefinition.taskRole);
 
+    // Public subnet + public IP is what makes `natGateways: 0` viable: the task
+    // needs outbound internet to reach Jetstream, pull its image from ECR, and
+    // call the S3/EventBridge APIs, and the internet gateway provides that for
+    // free where a NAT gateway would cost ~$33/month. CDK would default to
+    // these subnets anyway given `assignPublicIp`, but it's stated explicitly
+    // because the placement is the whole reason this works. The security group
+    // allows no inbound traffic, so the task is not reachable from outside.
+    // In a private-subnet design you'd need a NAT gateway regardless of VPC
+    // endpoints, since Jetstream is on the public internet.
     new ecs.FargateService(this, "IngestService", {
       cluster,
       taskDefinition,
       desiredCount: 1,
       assignPublicIp: true,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       minHealthyPercent: 100,
       circuitBreaker: { rollback: true },
     });
