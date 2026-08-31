@@ -5,9 +5,9 @@
 // archives it, fans it out, saves the new cursor, and exits — no
 // persistent connection, no VPC, no idle compute between polls.
 //
-// Real Jetstream's /subscribe endpoint supports resuming with
-// ?cursor=<time_us> (a unix-microsecond timestamp), which is exactly what
-// this Lambda uses. See the README for the tradeoffs vs. ingest-consumer.
+// Jetstream v2's subscribeEvents endpoint resumes with `?cursor=<seq>`, a
+// monotonic sequence number carried by every event. See the README for the
+// tradeoffs versus ingest-consumer.
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   EventBridgeClient,
@@ -42,6 +42,49 @@ const DETAIL_TYPE_BY_COLLECTION: Record<string, string> = {
   "pub.leaflet.graph.subscription": "subscription.created",
 };
 
+// Jetstream v2 sends proposal-0015 JSON envelopes. Only `#commit` messages
+// contain records; the subscription uses `kinds=commit`, but this validation
+// keeps an unexpected control message from advancing the saved cursor.
+type JetstreamCommit = {
+  seq: number;
+  did: string;
+  time: string;
+  operation: string;
+  collection: string;
+  record?: unknown;
+  raw: unknown;
+};
+
+function parseCommit(raw: unknown): JetstreamCommit | undefined {
+  if (typeof raw !== "object" || raw === null) return;
+  const message = raw as { $type?: unknown; payload?: unknown };
+  if (message.$type !== "message" || typeof message.payload !== "object" || message.payload === null) {
+    return;
+  }
+
+  const payload = message.payload as Record<string, unknown>;
+  if (
+    payload.$type !== "network.bsky.jetstream.subscribeEvents#commit" ||
+    typeof payload.seq !== "number" ||
+    typeof payload.did !== "string" ||
+    typeof payload.time !== "string" ||
+    typeof payload.operation !== "string" ||
+    typeof payload.collection !== "string"
+  ) {
+    return;
+  }
+
+  return {
+    seq: payload.seq,
+    did: payload.did,
+    time: payload.time,
+    operation: payload.operation,
+    collection: payload.collection,
+    record: payload.record,
+    raw,
+  };
+}
+
 const CURSOR_KEY = "poller"; // single fixed row - this demo only runs one poller
 
 // --- Cursor: where we left off last time -----------------------------------
@@ -50,14 +93,14 @@ async function getCursor(): Promise<number> {
   const result = await ddb.send(
     new GetCommand({ TableName: CURSOR_TABLE_NAME, Key: { id: CURSOR_KEY } }),
   );
-  return result.Item?.cursorUs ?? 0; // 0 = Jetstream's "replay from the beginning"
+  return result.Item?.cursor ?? 0; // 0 = Jetstream's "before the first event" sentinel
 }
 
-async function saveCursor(cursorUs: number) {
+async function saveCursor(cursor: number) {
   await ddb.send(
     new PutCommand({
       TableName: CURSOR_TABLE_NAME,
-      Item: { id: CURSOR_KEY, cursorUs },
+      Item: { id: CURSOR_KEY, cursor },
     }),
   );
 }
@@ -74,12 +117,12 @@ async function saveCursor(cursorUs: number) {
 // without ever firing 'error', so this only has the WebSocket's own events
 // to go on, not a guarantee they'll fire. The setTimeout below is a second,
 // independent guard so the poll still ends even if none of them do.
-function drainFirehose(cursor: number): Promise<any[]> {
+function drainFirehose(cursor: number): Promise<JetstreamCommit[]> {
   return new Promise((resolve) => {
-    const collected: any[] = [];
+    const collected: JetstreamCommit[] = [];
     // Built via URL/searchParams rather than string interpolation: once
     // FIREHOSE_URL carries its own query string (e.g. Leaflet's
-    // ?wantedCollections=... filter - see the README), naively appending
+    // ?collections=... filter - see the README), naively appending
     // "?cursor=" would produce a second "?" and a malformed URL.
     const wsUrl = new URL(FIREHOSE_URL);
     if (cursor > 0) wsUrl.searchParams.set("cursor", String(cursor));
@@ -104,7 +147,10 @@ function drainFirehose(cursor: number): Promise<any[]> {
 
     const timer = setTimeout(() => finish("timeout"), POLL_WINDOW_MS);
     ws.on("open", () => console.log("firehose connection open"));
-    ws.on("message", (data) => collected.push(JSON.parse(data.toString())));
+    ws.on("message", (data) => {
+      const commit = parseCommit(JSON.parse(data.toString()));
+      if (commit) collected.push(commit);
+    });
     ws.on("error", (err) => finish(`error: ${err.message}`));
     ws.on("close", () => finish("closed"));
   });
@@ -112,7 +158,7 @@ function drainFirehose(cursor: number): Promise<any[]> {
 
 // --- Same archive + fan-out steps as ingest-consumer, run once per poll ----
 
-async function archiveToS3(events: any[]) {
+async function archiveToS3(events: JetstreamCommit[]) {
   const now = new Date();
   const prefix = [
     now.getUTCFullYear(),
@@ -126,37 +172,38 @@ async function archiveToS3(events: any[]) {
     new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: key,
-      Body: events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      Body: events.map((event) => JSON.stringify(event.raw)).join("\n") + "\n",
       ContentType: "application/x-ndjson",
     }),
   );
   console.log(`archived ${events.length} events -> s3://${S3_BUCKET}/${key}`);
 }
 
-async function publishToEventBridge(events: any[]) {
+async function publishToEventBridge(events: JetstreamCommit[]) {
   // PutEvents accepts at most 10 entries per call, so chunk the batch. A
   // busy poll (e.g. catching up after a burst) can mean dozens of chunks -
   // sending them one at a time sequentially risks running past the Lambda
   // timeout before the cursor gets saved, which would silently reprocess
   // this whole range on the next poll. Sending chunks concurrently keeps a
   // large catch-up batch well within the timeout.
-  const chunks: any[][] = [];
+  const chunks: JetstreamCommit[][] = [];
   for (let i = 0; i < events.length; i += 10) chunks.push(events.slice(i, i + 10));
 
   await Promise.all(
     chunks.map((chunk) => {
       const entries = chunk
-        .filter((raw) => DETAIL_TYPE_BY_COLLECTION[raw.commit?.collection])
-        .map((raw) => ({
+        .filter((commit) => DETAIL_TYPE_BY_COLLECTION[commit.collection])
+        .map((commit) => ({
           EventBusName: EVENT_BUS_NAME,
           Source: "atproto.ingest",
-          DetailType: DETAIL_TYPE_BY_COLLECTION[raw.commit.collection],
+          DetailType: DETAIL_TYPE_BY_COLLECTION[commit.collection],
           Detail: JSON.stringify({
-            did: raw.did,
-            time_us: raw.time_us,
-            collection: raw.commit.collection,
-            operation: raw.commit.operation,
-            record: raw.commit.record,
+            did: commit.did,
+            cursor: commit.seq,
+            time: commit.time,
+            collection: commit.collection,
+            operation: commit.operation,
+            record: commit.record,
           }),
         }));
 
@@ -199,7 +246,7 @@ async function run() {
   await archiveToS3(events);
   await publishToEventBridge(events);
 
-  const newCursor = events[events.length - 1].time_us;
+  const newCursor = events[events.length - 1].seq;
   await saveCursor(newCursor);
   console.log(`processed ${events.length} events, cursor advanced to ${newCursor}`);
 }

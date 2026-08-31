@@ -13,7 +13,7 @@ const sqs = new SQSClient({});
 const QUEUE_URL = process.env.QUEUE_URL!;
 
 export async function handler(event: AtprotoEvent) {
-  const { did, record, time_us } = event.detail;
+  const { did, record, time } = event.detail;
 
   await sqs.send(
     new SendMessageCommand({
@@ -22,9 +22,9 @@ export async function handler(event: AtprotoEvent) {
         watchedPublication: record.publication, // publication that gained a new subscriber
         subscriberDid: did, // account that subscribed
         // pub.leaflet.graph.subscription records have no createdAt of
-        // their own (unlike app.bsky.graph.follow) - time_us is the
-        // firehose's own timestamp for this commit.
-        subscribedAt: new Date(time_us / 1000).toISOString(),
+        // their own (unlike app.bsky.graph.follow), so use Jetstream's
+        // timestamp for this commit.
+        subscribedAt: time,
       }),
     }),
   );

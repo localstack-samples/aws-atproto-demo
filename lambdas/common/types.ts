@@ -3,7 +3,8 @@
 // `event.detail`.
 export interface AtprotoEventDetail {
   did: string; // repo owner — the user whose account emitted this commit
-  time_us: number; // microsecond timestamp from the firehose
+  cursor: number; // Jetstream v2's monotonic sequence number
+  time: string; // event timestamp in RFC 3339 format
   collection: string; // record type, e.g. "app.bsky.feed.post" (a Bluesky post)
   operation: string; // "create" | "delete" | "update"
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

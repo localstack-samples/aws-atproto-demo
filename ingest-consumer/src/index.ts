@@ -5,7 +5,7 @@
 // The firehose is a WebSocket — a long-lived, always-open connection. Lambda
 // functions are short-lived and time out; Fargate runs a container 24/7.
 //
-// This process does exactly two things for every event it receives:
+// This process does exactly two things for every Jetstream commit it receives:
 //   1. Append the raw JSON line to S3 (durable archive you can replay later).
 //   2. Publish a normalized copy to Amazon EventBridge so downstream
 //      consumers (analytics, moderation, notifications Lambdas) can react
@@ -41,6 +41,47 @@ const DETAIL_TYPE_BY_COLLECTION: Record<string, string> = {
   "pub.leaflet.graph.subscription": "subscription.created",
 };
 
+// Jetstream v2 sends proposal-0015 JSON envelopes. Only `#commit` messages
+// contain records; account, identity, sync, and info messages have different
+// shapes and are excluded by the `kinds=commit` subscription filter.
+type JetstreamCommit = {
+  seq: number;
+  did: string;
+  time: string;
+  operation: string;
+  collection: string;
+  record?: unknown;
+};
+
+function parseCommit(raw: unknown): JetstreamCommit | undefined {
+  if (typeof raw !== "object" || raw === null) return;
+  const message = raw as { $type?: unknown; payload?: unknown };
+  if (message.$type !== "message" || typeof message.payload !== "object" || message.payload === null) {
+    return;
+  }
+
+  const payload = message.payload as Record<string, unknown>;
+  if (
+    payload.$type !== "network.bsky.jetstream.subscribeEvents#commit" ||
+    typeof payload.seq !== "number" ||
+    typeof payload.did !== "string" ||
+    typeof payload.time !== "string" ||
+    typeof payload.operation !== "string" ||
+    typeof payload.collection !== "string"
+  ) {
+    return;
+  }
+
+  return {
+    seq: payload.seq,
+    did: payload.did,
+    time: payload.time,
+    operation: payload.operation,
+    collection: payload.collection,
+    record: payload.record,
+  };
+}
+
 // --- S3 raw archive: buffer NDJSON, flush on count or timer -----------------
 
 let buffer: string[] = [];
@@ -74,8 +115,8 @@ setInterval(flushToS3, FLUSH_INTERVAL_MS);
 
 // --- EventBridge fan-out: thin normalization, then PutEvents ----------------
 
-async function publishToEventBridge(raw: any) {
-  const detailType = DETAIL_TYPE_BY_COLLECTION[raw.commit?.collection];
+async function publishToEventBridge(commit: JetstreamCommit) {
+  const detailType = DETAIL_TYPE_BY_COLLECTION[commit.collection];
   if (!detailType) return; // ignore collections this demo doesn't route
 
   // EventBridge is AWS's event bus — publish once, many subscribers can react.
@@ -87,11 +128,12 @@ async function publishToEventBridge(raw: any) {
           Source: "atproto.ingest",
           DetailType: detailType,
           Detail: JSON.stringify({
-            did: raw.did,
-            time_us: raw.time_us,
-            collection: raw.commit.collection,
-            operation: raw.commit.operation,
-            record: raw.commit.record,
+            did: commit.did,
+            cursor: commit.seq,
+            time: commit.time,
+            collection: commit.collection,
+            operation: commit.operation,
+            record: commit.record,
           }),
         },
       ],
@@ -108,11 +150,14 @@ function connect() {
 
   ws.on("message", async (data) => {
     const line = data.toString(); // one Jetstream commit, one JSON line
-    buffer.push(line);
-    if (buffer.length >= FLUSH_MAX_EVENTS) flushToS3().catch(console.error);
 
     try {
-      await publishToEventBridge(JSON.parse(line));
+      const commit = parseCommit(JSON.parse(line));
+      if (!commit) return;
+
+      buffer.push(line);
+      if (buffer.length >= FLUSH_MAX_EVENTS) flushToS3().catch(console.error);
+      await publishToEventBridge(commit);
     } catch (err) {
       console.error("failed to publish event to EventBridge:", err);
     }

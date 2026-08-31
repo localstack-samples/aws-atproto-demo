@@ -8,9 +8,10 @@
 // - Jetstream (https://github.com/bluesky-social/jetstream) is a Bluesky
 //   service that forwards those commits over a WebSocket as plain JSON.
 //
-// This mock replays canned commits in Jetstream shape so the rest of the demo
-// can run offline. Swap the ingest consumer's FIREHOSE_URL to
-// wss://jetstream2.us-east.bsky.network/subscribe for the real stream.
+// This mock wraps canned commits in Jetstream v2's proposal-0015 JSON envelope
+// so the rest of the demo can run offline. Point the consumers at
+// wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents
+// for the real stream.
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
@@ -38,7 +39,13 @@ function nextDelayMs(): number {
   return min + Math.random() * (max - min);
 }
 
-// Real Jetstream supports resuming a subscription with ?cursor=<time_us>,
+function jetstreamTime(): string {
+  // Jetstream v2 times always have six fractional-second digits. JavaScript's
+  // ISO serializer provides milliseconds, so append three zeroes for micros.
+  return `${new Date().toISOString().slice(0, -1)}000Z`;
+}
+
+// Real Jetstream supports resuming a subscription with ?cursor=<seq>,
 // replaying anything missed since that point. Our ingest-consumer never
 // disconnects so it never needs this, but ingest-poller (the interval-based
 // alternative) connects briefly, disconnects, and reconnects later with the
@@ -68,23 +75,39 @@ wss.on("connection", (ws, req) => {
   console.log(`client connected (${wss.clients.size} total)`);
   ws.on("close", () => console.log(`client disconnected (${wss.clients.size} total)`));
 
-  // ?cursor=<time_us>: replay anything broadcast after that point before this
+  // ?cursor=<seq>: replay anything broadcast at or after that point before this
   // client starts receiving new live events, so a poller that was offline
   // between connections catches up instead of silently missing events.
   const cursor = Number(new URL(req.url ?? "", "http://x").searchParams.get("cursor"));
   if (cursor > 0) {
-    const missed = history.filter((event) => event.time_us >= cursor);
+    const missed = history.filter((event) => event.payload.seq >= cursor);
     for (const event of missed) ws.send(JSON.stringify(event));
     console.log(`replayed ${missed.length} events since cursor ${cursor}`);
   }
 });
 
-// Broadcast the same stream to every WebSocket client. Re-stamp time_us on
-// each replay so looped sample data always looks "live".
+// Broadcast the same stream to every WebSocket client. Assign a monotonic
+// Jetstream sequence number and a current observation time to each event.
 async function playForever() {
   let i = 0;
+  let seq = 1;
   while (true) {
-    const event = { ...events[i % events.length], time_us: Date.now() * 1000 };
+    const source = events[i % events.length];
+    const event = {
+      $type: "message",
+      payload: {
+        $type: "network.bsky.jetstream.subscribeEvents#commit",
+        seq: seq++,
+        did: source.did,
+        time: jetstreamTime(),
+        rev: source.commit.rev,
+        operation: source.commit.operation,
+        collection: source.commit.collection,
+        rkey: source.commit.rkey,
+        cid: source.commit.cid,
+        record: source.commit.record,
+      },
+    };
 
     history.push(event);
     if (history.length > HISTORY_SIZE) history.shift();

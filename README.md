@@ -40,7 +40,7 @@ alternative swaps the Fargate box for a scheduled Lambda, but everything to the 
 
 | Decision           | Choice                                                                                                                                      | Why                                                                                                                                                                                                                                                                                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Firehose format    | Mock **Jetstream-style JSON**, not raw `subscribeRepos` CBOR/CAR                                                                            | Raw firehose requires CBOR/CAR decoding — genuinely complex and a distraction from the architecture story. Jetstream is what most real integrations use anyway.                                                                                                                                                                                                     |
+| Firehose format    | Mock **Jetstream v2 JSON**, not raw `subscribeRepos` CBOR/CAR                                                                               | Raw firehose requires CBOR/CAR decoding — genuinely complex and a distraction from the architecture story. Jetstream v2 delivers a typed JSON envelope over WebSocket, which is what the demo consumes.                                                                                                                                                             |
 | Ingest compute     | **Fargate or Lambda** — two interchangeable options                                                                                         | See [two ways to ingest](#two-ways-to-ingest). Fargate holds a persistent connection open; Lambda polls on a schedule. Which one you choose depends on how much latency your use case can tolerate.                                                                                                                                                                 |
 | Fan-out mechanism  | **EventBridge**, not direct invocation or SNS                                                                                               | EventBridge is AWS's event bus. Content-based filtering lets each consumer subscribe to exactly what it needs without the ingest side knowing any of them exist. Consumers can be added or removed independently.                                                                                                                                                   |
 | Raw storage        | **S3, written before fan-out**                                                                                                              | S3 is object storage. The raw NDJSON log is the source of truth, independent of whatever EventBridge consumers exist today. It enables replay/reprocessing later.                                                                                                                                                                                                   |
@@ -58,7 +58,7 @@ Both stacks provision the _identical_ downstream contract: same S3 bucket name, 
 | Delivery latency      | Near-real-time (~1s)                             | Bounded by the poll interval                                                                                                           |
 | Idle cost             | Pays for a running container 24/7                | Pays only per invocation                                                                                                               |
 | Extra infra           | VPC, ECS cluster, Fargate service                | One DynamoDB table (`IngestCursor`) to remember where it left off                                                                      |
-| How it resumes        | Never disconnects                                | Reconnects with `?cursor=<time_us>`, replaying anything missed — the same mechanism the real Jetstream `/subscribe` endpoint documents |
+| How it resumes        | Never disconnects                                | Reconnects with `?cursor=<seq>`, replaying from the last Jetstream v2 sequence number at the `subscribeEvents` endpoint |
 | The "spike" demo beat | Counters visibly climb in real time as you watch | Trigger the spike, then the next poll (scheduled, or triggered manually) catches the whole burst up in one batch                       |
 
 Use `infra-fargate/` when you want events processed as they happen. Use
@@ -318,7 +318,7 @@ with the override set to an empty value to omit it:
 
 ```bash
 cd infra-fargate
-AWS_ENDPOINT_URL_FOR_CONSUMER= FIREHOSE_URL="wss://jetstream.us-east.bsky.network/subscribe?collections=pub.leaflet.document" cdk deploy --require-approval never
+AWS_ENDPOINT_URL_FOR_CONSUMER= FIREHOSE_URL="wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents?kinds=commit&collections=pub.leaflet.document" cdk deploy --require-approval never
 ```
 
 Networking needs no extra work. The stack creates a VPC with `natGateways: 0`
@@ -348,25 +348,27 @@ Jetstream supports filtering to specific collections at the source via a repeate
 # infra-fargate
 cd infra-fargate
 lstk cdk bootstrap
-FIREHOSE_URL="wss://jetstream.us-east.bsky.network/subscribe?collections=pub.leaflet.document&collections=pub.leaflet.comment&collections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
+FIREHOSE_URL="wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents?kinds=commit&collections=pub.leaflet.document&collections=pub.leaflet.comment&collections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
 
 # infra-poller
 cd infra-poller
 lstk cdk bootstrap
-FIREHOSE_URL="wss://jetstream.us-east.bsky.network/subscribe?collections=pub.leaflet.document&collections=pub.leaflet.comment&collections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
+FIREHOSE_URL="wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents?kinds=commit&collections=pub.leaflet.document&collections=pub.leaflet.comment&collections=pub.leaflet.graph.subscription" lstk cdk deploy --require-approval never
 ```
 
 No further code changes required. The Fargate task picks up the new URL on its next restart (deploy triggers one automatically); the poller Lambda picks it up on its next invocation.
 
 `jetstream.us-east.bsky.network` / `jetstream.us-west.bsky.network` are the
 [v2 Jetstream hosts](https://atproto.com/blog/introducing-bluesky-protocol-services).
-The live tail here is unauthenticated and behaves the same as before —
-same envelope shape, same `?cursor=<time_us>` reconnect semantics. v2's
-only wire-level change that matters for this demo is the filter
-parameter's name (`collections`, not v1's `wantedCollections`); the older
-`jetstream1`/`jetstream2.us-east`/`us-west` v1 hosts keep running
-unchanged if you ever need them, just with the old parameter name. v2 also
-adds an authenticated historical-replay API (`planSnapshot`/`listSegments`/`getSegment`)
+The live tail is unauthenticated, but v2 uses its own
+`/xrpc/network.bsky.jetstream.subscribeEvents` endpoint and a typed JSON
+envelope: commit data is in `message.payload`, and `payload.seq` is the
+cursor to save for reconnects. The `kinds=commit` filter excludes account,
+identity, and sync messages so this demo receives only record mutations.
+The older `jetstream1`/`jetstream2.us-east`/`us-west` v1 hosts and their
+`/subscribe` endpoint use a different payload and `wantedCollections`
+parameter; they are not interchangeable with this demo. v2 also adds an
+authenticated historical-replay API (`planSnapshot`/`listSegments`/`getSegment`)
 for backfilling from an archive, which this demo doesn't use.
 
 Leaflet is a small, beta-stage app, so expect real traffic to be
@@ -381,9 +383,9 @@ You can choose to point at the full unfiltered firehose instead by dropping the 
 
 ## What each piece actually does
 
-- **`firehose-mock/`** replays [`sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) (35 hand-authored `pub.leaflet.document`/`comment`/`graph.subscription` commit events, matching [Leaflet](https://leaflet.pub)'s actual lexicon shape) on a jittered loop, over a plain WebSocket. `POST /spike` temporarily collapses the delay between events.
+- **`firehose-mock/`** replays [`sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) (35 hand-authored `pub.leaflet.document`/`comment`/`graph.subscription` commit events, matching [Leaflet](https://leaflet.pub)'s actual lexicon shape) in Jetstream v2 envelopes on a jittered loop, over a plain WebSocket. `POST /spike` temporarily collapses the delay between events.
 - **`ingest-consumer/`** (used by `infra-fargate/`) holds the WebSocket connection open, buffers events, flushes NDJSON to S3 on a count/time threshold, and maps each event's ATProto `collection` field to an EventBridge detail-type (`pub.leaflet.document` → `document.created`, etc.) before publishing it.
-- **`ingest-poller/`** (used by `infra-poller/`) does the same archive-then-publish job, but wakes up on a schedule instead of staying connected: reads the last cursor from DynamoDB, connects to the firehose with `?cursor=<value>` for up to 10 seconds to drain whatever's new, archives and publishes it all in one batch, then saves the new cursor and exits. The collection → detail-type mapping is duplicated from `ingest-consumer/` rather than shared. Each ingestion path stays readable on its own, without cross-referencing the other's internals.
+- **`ingest-poller/`** (used by `infra-poller/`) does the same archive-then-publish job, but wakes up on a schedule instead of staying connected: reads the last Jetstream sequence cursor from DynamoDB, connects to the firehose with `?cursor=<seq>` for up to 10 seconds to drain whatever's new, archives and publishes it all in one batch, then saves the new cursor and exits. The collection → detail-type mapping is duplicated from `ingest-consumer/` rather than shared. Each ingestion path stays readable on its own, without cross-referencing the other's internals.
 - **`lambdas/analytics`** matches every event on the bus and increments a per-event-type, per-hour counter in DynamoDB.
 - **`lambdas/moderation`** is only invoked for `comment.created` events whose `record.plaintext` matched a keyword list via EventBridge's wildcard content filtering. The Lambda itself just records the hit in DynamoDB. (`pub.leaflet.document` has no plaintext field of its own — its content lives in nested block pages — so moderation only ever fires on comments, not documents. EventBridge filters are also case-sensitive and match substrings literally, not by meaning; a full-featured moderation system would apply semantic analysis or human review on top of keyword filters.)
 
