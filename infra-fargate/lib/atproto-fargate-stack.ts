@@ -59,6 +59,15 @@ export class AtprotoFargateStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    // The long-running consumer uses this cursor to resume a Jetstream v2
+    // subscription after a task restart or WebSocket disconnect.
+    const ingestCursor = new dynamodb.Table(this, "IngestCursor", {
+      tableName: "IngestCursor",
+      partitionKey: { name: "id", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
     const notificationsQueue = new sqs.Queue(this, "NotificationsQueue", {
       queueName: "notifications-queue",
       removalPolicy: RemovalPolicy.DESTROY,
@@ -203,6 +212,7 @@ export class AtprotoFargateStack extends Stack {
         FIREHOSE_URL: process.env.FIREHOSE_URL ?? "ws://host.docker.internal:8080",
         S3_BUCKET: rawArchiveBucket.bucketName,
         EVENT_BUS_NAME: eventBus.eventBusName,
+        CURSOR_TABLE_NAME: ingestCursor.tableName,
         // Only set when targeting LocalStack. The SDK reads AWS_ENDPOINT_URL
         // from the environment, so leaving it in place on real AWS would send
         // every S3/EventBridge call to host.docker.internal and fail. Deploy
@@ -213,6 +223,7 @@ export class AtprotoFargateStack extends Stack {
 
     rawArchiveBucket.grantWrite(taskDefinition.taskRole);
     eventBus.grantPutEventsTo(taskDefinition.taskRole);
+    ingestCursor.grantReadWriteData(taskDefinition.taskRole);
 
     // Public subnet + public IP is what makes `natGateways: 0` viable: the task
     // needs outbound internet to reach Jetstream, pull its image from ECR, and

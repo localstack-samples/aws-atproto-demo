@@ -15,17 +15,25 @@ import {
   EventBridgeClient,
   PutEventsCommand,
 } from "@aws-sdk/client-eventbridge";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+} from "@aws-sdk/lib-dynamodb";
 import WebSocket from "ws";
 
 const FIREHOSE_URL = process.env.FIREHOSE_URL ?? "ws://localhost:8080";
 const S3_BUCKET = process.env.S3_BUCKET ?? "raw-firehose-archive";
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME ?? "atproto-events";
+const CURSOR_TABLE_NAME = process.env.CURSOR_TABLE_NAME ?? "IngestCursor";
 const FLUSH_MAX_EVENTS = Number(process.env.FLUSH_MAX_EVENTS ?? 20);
 const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS ?? 10_000);
 
 // LocalStack S3 expects path-style URLs (bucket in the path, not the hostname).
 const s3 = new S3Client({ forcePathStyle: true });
 const eventBridge = new EventBridgeClient({});
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 // ATProto "collections" name the kind of record in a commit. We map each
 // to an EventBridge detail-type so rules can filter on event kind without
@@ -82,6 +90,28 @@ function parseCommit(raw: unknown): JetstreamCommit | undefined {
   };
 }
 
+// The sequence cursor is stored separately from the poller cursor so either
+// ingestion stack can be deployed independently. Jetstream resumes
+// inclusively, making this at-least-once: the last processed event may replay
+// after a restart, but an outage cannot create a gap.
+const CURSOR_KEY = "fargate";
+
+async function getCursor(): Promise<number> {
+  const result = await ddb.send(
+    new GetCommand({ TableName: CURSOR_TABLE_NAME, Key: { id: CURSOR_KEY } }),
+  );
+  return result.Item?.cursor ?? 0;
+}
+
+async function saveCursor(cursor: number) {
+  await ddb.send(
+    new PutCommand({
+      TableName: CURSOR_TABLE_NAME,
+      Item: { id: CURSOR_KEY, cursor },
+    }),
+  );
+}
+
 // --- S3 raw archive: buffer NDJSON, flush on count or timer -----------------
 
 let buffer: string[] = [];
@@ -120,7 +150,7 @@ async function publishToEventBridge(commit: JetstreamCommit) {
   if (!detailType) return; // ignore collections this demo doesn't route
 
   // EventBridge is AWS's event bus — publish once, many subscribers can react.
-  await eventBridge.send(
+  const result = await eventBridge.send(
     new PutEventsCommand({
       Entries: [
         {
@@ -139,36 +169,74 @@ async function publishToEventBridge(commit: JetstreamCommit) {
       ],
     }),
   );
+
+  // PutEvents can succeed at the HTTP level while rejecting an individual
+  // entry. With one entry per call, any failed entry must prevent the cursor
+  // from advancing so Jetstream can replay it after reconnecting.
+  if (result.FailedEntryCount) {
+    const failedEntry = result.Entries?.find((entry) => entry.ErrorCode);
+    throw new Error(
+      `EventBridge rejected event: ${failedEntry?.ErrorCode ?? "unknown error"} ${failedEntry?.ErrorMessage ?? ""}`,
+    );
+  }
 }
 
-// --- WebSocket: connect to mock firehose or real Jetstream ------------------
+// --- WebSocket: reconnect from a durable Jetstream cursor -------------------
 
-function connect() {
-  const ws = new WebSocket(FIREHOSE_URL);
+function scheduleReconnect() {
+  setTimeout(start, 2000);
+}
 
-  ws.on("open", () => console.log(`connected to firehose at ${FIREHOSE_URL}`));
+function start() {
+  void connect().catch((err) => {
+    console.error("failed to connect to firehose:", err);
+    scheduleReconnect();
+  });
+}
 
-  ws.on("message", async (data) => {
-    const line = data.toString(); // one Jetstream commit, one JSON line
+async function connect() {
+  const cursor = await getCursor();
+  const wsUrl = new URL(FIREHOSE_URL);
+  if (cursor > 0) wsUrl.searchParams.set("cursor", String(cursor));
+  const url = wsUrl.toString();
+  const ws = new WebSocket(url);
+  let stopped = false;
 
-    try {
-      const commit = parseCommit(JSON.parse(line));
-      if (!commit) return;
+  // WebSocket message callbacks can overlap when an AWS call awaits. Chain
+  // them so a later cursor is never saved ahead of an earlier failed event.
+  let processing = Promise.resolve();
 
-      buffer.push(line);
-      if (buffer.length >= FLUSH_MAX_EVENTS) flushToS3().catch(console.error);
-      await publishToEventBridge(commit);
-    } catch (err) {
-      console.error("failed to publish event to EventBridge:", err);
-    }
+  ws.on("open", () => console.log(`connected to firehose at ${url}`));
+  ws.on("message", (data) => {
+    if (stopped) return;
+
+    processing = processing
+      .then(async () => {
+        if (stopped) return;
+        const line = data.toString();
+        const commit = parseCommit(JSON.parse(line));
+        if (!commit) return;
+
+        buffer.push(line);
+        if (buffer.length >= FLUSH_MAX_EVENTS) flushToS3().catch(console.error);
+        await publishToEventBridge(commit);
+        await saveCursor(commit.seq);
+      })
+      .catch((err) => {
+        stopped = true;
+        console.error("failed to process firehose event:", err);
+        ws.terminate();
+      });
   });
 
-  // Reconnect on disconnect — the firehose (or mock) may restart.
+  // Wait for in-flight, ordered processing before reconnecting. The saved
+  // cursor remains on the last successful event, so Jetstream replays any
+  // event interrupted by the connection failure.
   ws.on("close", () => {
     console.log("firehose connection closed, reconnecting in 2s");
-    setTimeout(connect, 2000);
+    void processing.finally(scheduleReconnect);
   });
   ws.on("error", (err) => console.error("firehose connection error:", err.message));
 }
 
-connect();
+start();

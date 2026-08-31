@@ -8,7 +8,7 @@ standalone, independently deployable stack. One stack delivers near-real-time up
 basis:
 
 - **`infra-fargate/`** — an always-on Fargate task holds the firehose
-  WebSocket open indefinitely. This delivers near-real-time updates but
+  WebSocket open and resumes from a durable cursor after a disconnect. This delivers near-real-time updates but
   requires more infrastructure (a VPC, a container) and will incur more
   costs.
 - **`infra-poller/`** — a scheduled Lambda that wakes up every couple of
@@ -57,8 +57,8 @@ Both stacks provision the _identical_ downstream contract: same S3 bucket name, 
 | Ingestion compute     | ECS Fargate task, always running                 | Lambda, invoked on a schedule (default every 2 minutes)                                                                                |
 | Delivery latency      | Near-real-time (~1s)                             | Bounded by the poll interval                                                                                                           |
 | Idle cost             | Pays for a running container 24/7                | Pays only per invocation                                                                                                               |
-| Extra infra           | VPC, ECS cluster, Fargate service                | One DynamoDB table (`IngestCursor`) to remember where it left off                                                                      |
-| How it resumes        | Never disconnects                                | Reconnects with `?cursor=<seq>`, replaying from the last Jetstream v2 sequence number at the `subscribeEvents` endpoint |
+| Extra infra           | VPC, ECS cluster, Fargate service, `IngestCursor` table | One DynamoDB table (`IngestCursor`) to remember where it left off                                                                |
+| How it resumes        | Reconnects with `?cursor=<seq>` after a disconnect | Reconnects with `?cursor=<seq>`, replaying from the last Jetstream v2 sequence number at the `subscribeEvents` endpoint |
 | The "spike" demo beat | Counters visibly climb in real time as you watch | Trigger the spike, then the next poll (scheduled, or triggered manually) catches the whole burst up in one batch                       |
 
 Use `infra-fargate/` when you want events processed as they happen. Use
@@ -150,7 +150,7 @@ see [deploying to real AWS](#deploying-to-real-aws).
 prompt. Without it, `cdk deploy` waits for an interactive y/n answer before touching anything. Drop the flag if you want to review IAM
 changes before every deploy against real AWS.
 
-This stands up S3, both DynamoDB tables, the SQS queue, the
+This stands up S3, three DynamoDB tables (including the ingest cursor), the SQS queue, the
 EventBridge bus and its three content-filtered rules, all three Lambdas,
 and an ECS Fargate service running the ingest consumer.
 
@@ -168,7 +168,8 @@ npm start
 
 The ingest consumer is already running in Fargate and retrying its
 WebSocket connection every 2 seconds — it picks up the stream as soon as
-the mock server is listening.
+the mock server is listening. On a later disconnect or task restart, it
+reconnects from the last successfully persisted Jetstream sequence cursor.
 
 **5. Watch it flow**
 
@@ -384,7 +385,7 @@ You can choose to point at the full unfiltered firehose instead by dropping the 
 ## What each piece actually does
 
 - **`firehose-mock/`** replays [`sample-events.ndjson`](firehose-mock/data/sample-events.ndjson) (35 hand-authored `pub.leaflet.document`/`comment`/`graph.subscription` commit events, matching [Leaflet](https://leaflet.pub)'s actual lexicon shape) in Jetstream v2 envelopes on a jittered loop, over a plain WebSocket. `POST /spike` temporarily collapses the delay between events.
-- **`ingest-consumer/`** (used by `infra-fargate/`) holds the WebSocket connection open, buffers events, flushes NDJSON to S3 on a count/time threshold, and maps each event's ATProto `collection` field to an EventBridge detail-type (`pub.leaflet.document` → `document.created`, etc.) before publishing it.
+- **`ingest-consumer/`** (used by `infra-fargate/`) holds the WebSocket connection open, buffers events, flushes NDJSON to S3 on a count/time threshold, and maps each event's ATProto `collection` field to an EventBridge detail-type (`pub.leaflet.document` → `document.created`, etc.) before publishing it. It saves the last successfully published Jetstream sequence cursor in DynamoDB and uses it to resume after a disconnect.
 - **`ingest-poller/`** (used by `infra-poller/`) does the same archive-then-publish job, but wakes up on a schedule instead of staying connected: reads the last Jetstream sequence cursor from DynamoDB, connects to the firehose with `?cursor=<seq>` for up to 10 seconds to drain whatever's new, archives and publishes it all in one batch, then saves the new cursor and exits. The collection → detail-type mapping is duplicated from `ingest-consumer/` rather than shared. Each ingestion path stays readable on its own, without cross-referencing the other's internals.
 - **`lambdas/analytics`** matches every event on the bus and increments a per-event-type, per-hour counter in DynamoDB.
 - **`lambdas/moderation`** is only invoked for `comment.created` events whose `record.plaintext` matched a keyword list via EventBridge's wildcard content filtering. The Lambda itself just records the hit in DynamoDB. (`pub.leaflet.document` has no plaintext field of its own — its content lives in nested block pages — so moderation only ever fires on comments, not documents. EventBridge filters are also case-sensitive and match substrings literally, not by meaning; a full-featured moderation system would apply semantic analysis or human review on top of keyword filters.)
