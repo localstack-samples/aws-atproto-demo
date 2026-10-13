@@ -89,6 +89,7 @@ To run locally on LocalStack, you'll need the following:
 - A valid LocalStack license (Note that the `infra-poller` pipeline will run on a free hobby license but infra-fargate requires ECS, which is part of a paid plan or active trial.)
 - [`lstk`](https://github.com/localstack/lstk) installed and able to run
   `lstk start` (log in first with `lstk login` if you have not set your authentication token)
+- The AWS CDK CLI (`npm install -g aws-cdk`). `lstk cdk` runs the `cdk` on your `PATH`.
 
 ## Quickstart
 
@@ -152,6 +153,21 @@ changes before every deploy against real AWS.
 This stands up S3, three DynamoDB tables (including the ingest cursor), the notification SQS queue and failure queues, the
 EventBridge bus and its three content-filtered rules, all three Lambdas,
 and an ECS Fargate service running the ingest consumer.
+
+On Linux with Docker Engine (not Docker Desktop), containers can't resolve
+`host.docker.internal`, which the stack uses by default to reach the mock
+firehose and LocalStack. Deploy with these overrides instead. `172.17.0.1` is
+Docker's default bridge gateway (check with `docker network inspect bridge`),
+and `localhost.localstack.cloud` resolves to LocalStack from inside the
+containers it starts:
+
+```bash
+FIREHOSE_URL=ws://172.17.0.1:8080 \
+AWS_ENDPOINT_URL_FOR_CONSUMER=http://localhost.localstack.cloud:4566 \
+lstk cdk deploy --require-approval never
+```
+
+The same `FIREHOSE_URL` override applies to `infra-poller`.
 
 Give Fargate 30–60 seconds after deploy to pull the container image and
 start the ingest consumer. If the verification commands in step 5 return
@@ -300,6 +316,31 @@ lstk reset
 `lstk reset` clears LocalStack state and the Lambda/ECS containers it
 spawned. See [LocalStack vs. real AWS](#localstack-vs-real-aws) if you need more aggressive cleanup (e.g. after pointing at the full unfiltered
 firehose).
+
+## Testing
+
+`test.sh` checks either stack end to end. Deploy the stack, stop the mock
+firehose if it's running (the script starts its own on port 8080), then run:
+
+```bash
+./test.sh fargate   # or: ./test.sh poller
+```
+
+It streams events through the pipeline, stops the stream, and compares every
+downstream result with the S3 raw archive:
+
+- `AnalyticsCounts` holds one count per archived event, per type and hour
+- `FlaggedContent` holds exactly the archived comments that contain a
+  moderation keyword
+- `notifications-queue` holds exactly the archived subscriptions to a
+  watchlisted publication
+- the downstream failure queues are empty
+
+For `infra-poller`, it also invokes the poller twice, 30 seconds apart, and
+checks that the second poll resumes from the saved cursor and catches up on
+the events it missed. The test reads the notifications queue, so run it on a
+fresh deployment (`lstk reset`, then deploy). CI runs it for both stacks on
+every pull request.
 
 ## LocalStack vs. real AWS
 
